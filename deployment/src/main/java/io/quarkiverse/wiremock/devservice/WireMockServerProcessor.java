@@ -10,10 +10,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import io.quarkus.deployment.annotations.Produce;
 import org.jboss.logging.Logger;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -21,6 +25,7 @@ import com.github.tomakehurst.wiremock.common.ClasspathFileSource;
 import com.github.tomakehurst.wiremock.common.Notifier;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 
+import io.quarkiverse.wiremock.items.WireMockFileMappingBuildItem;
 import io.quarkus.arc.deployment.ValidationPhaseBuildItem.ValidationErrorBuildItem;
 import io.quarkus.deployment.IsDevelopment;
 import io.quarkus.deployment.annotations.BuildProducer;
@@ -51,10 +56,10 @@ class WireMockServerProcessor {
         return new FeatureBuildItem(FEATURE_NAME);
     }
 
-    @BuildStep(onlyIf = { WireMockServerEnabled.class, DevServicesConfig.Enabled.class })
+    @BuildStep(onlyIf = {WireMockServerEnabled.class, DevServicesConfig.Enabled.class})
     DevServicesResultBuildItem setup(LaunchModeBuildItem launchMode, LiveReloadBuildItem liveReload,
-            CuratedApplicationShutdownBuildItem shutdown, WireMockServerBuildTimeConfig config,
-            BuildProducer<ValidationErrorBuildItem> configErrors) {
+                                     CuratedApplicationShutdownBuildItem shutdown, WireMockServerBuildTimeConfig config,
+                                     BuildProducer<ValidationErrorBuildItem> configErrors) {
 
         Log.debugf("Quarkus launch mode [%s]", launchMode.getLaunchMode());
 
@@ -79,26 +84,53 @@ class WireMockServerProcessor {
         return devService.toBuildItem();
     }
 
-    @BuildStep(onlyIf = { WireMockServerEnabled.class, DevServicesConfig.Enabled.class })
+    @BuildStep(onlyIf = {WireMockServerEnabled.class, DevServicesConfig.Enabled.class})
     @Consume(DevServicesResultBuildItem.class)
     DevServiceDescriptionBuildItem renderDevServiceDevUICard() {
         return new DevServiceDescriptionBuildItem(DEV_SERVICE_NAME, null, (ContainerInfo) null, devService.getConfig());
     }
 
-    @BuildStep(onlyIf = { WireMockServerEnabled.class, DevServicesConfig.Enabled.class, IsDevelopment.class })
-    void watchWireMockConfigFiles(WireMockServerBuildTimeConfig config,
-            BuildProducer<HotDeploymentWatchedFileBuildItem> items) {
+    @Produce(HotDeploymentWatchedFileBuildItem.class)
+    @BuildStep(onlyIf = {WireMockServerEnabled.class, DevServicesConfig.Enabled.class})
+    void watchWireMockFileMappingBuildItems(WireMockServerBuildTimeConfig config, List<WireMockFileMappingBuildItem> fileMappings, LiveReloadBuildItem liveReload) {
+        FileMappingContext context = liveReload.getContextObject(FileMappingContext.class);
+        if (context == null) {
+            Map<String, String> mappings = fileMappings.stream()
+                    .collect(Collectors.toMap(
+                            WireMockFileMappingBuildItem::filename,
+                            WireMockFileMappingBuildItem::content));
+            liveReload.setContextObject(FileMappingContext.class, new FileMappingContext(mappings));
+        }
 
         if (!config.isClasspathFilesMapping()) {
-            listFiles(Paths.get(config.effectiveFileMapping(), MAPPINGS),
-                    Paths.get(config.effectiveFileMapping(), FILES)).forEach(file -> {
-                        Log.debugf("Watching [%s] for hot deployment!", file);
-                        items.produce(new HotDeploymentWatchedFileBuildItem(file));
+            Path mappingsDir = Paths.get(config.effectiveFileMapping(), MAPPINGS);
+            liveReload.getContextObject(FileMappingContext.class)
+                    .mappings()
+                    .forEach((filename, content) -> {
+                        try {
+                            Files.writeString(mappingsDir.resolve(filename), content);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
                     });
         }
     }
 
-    @BuildStep(onlyIf = { WireMockServerEnabled.class, DevServicesConfig.Enabled.class, IsDevelopment.class })
+    @BuildStep(onlyIf = {WireMockServerEnabled.class, DevServicesConfig.Enabled.class, IsDevelopment.class})
+    void watchWireMockConfigFiles(WireMockServerBuildTimeConfig config,
+                                  BuildProducer<HotDeploymentWatchedFileBuildItem> items) {
+        if (!config.isClasspathFilesMapping()) {
+            Path mappingsDir = Paths.get(config.effectiveFileMapping(), MAPPINGS);
+
+            listFiles(mappingsDir,
+                    Paths.get(config.effectiveFileMapping(), FILES)).forEach(file -> {
+                Log.debugf("Watching [%s] for hot deployment!", file);
+                items.produce(new HotDeploymentWatchedFileBuildItem(file));
+            });
+        }
+    }
+
+    @BuildStep(onlyIf = {WireMockServerEnabled.class, DevServicesConfig.Enabled.class, IsDevelopment.class})
     @Consume(DevServicesResultBuildItem.class)
     public CardPageBuildItem pages() {
 
@@ -187,6 +219,18 @@ class WireMockServerProcessor {
         @Override
         public void error(String message, Throwable t) {
             LOGGER.error(message, t);
+        }
+    }
+
+    private static final class FileMappingContext {
+        private final Map<String, String> mappings = new HashMap<>();
+
+        public FileMappingContext(Map<String, String> mappings) {
+            this.mappings.putAll(mappings);
+        }
+
+        public Map<String, String> mappings() {
+            return this.mappings;
         }
     }
 }
